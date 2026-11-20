@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -79,6 +80,12 @@ def save_checkpoint(path, model, optimizer, settings, step, seconds, data):
     temporary = path.with_suffix(".pt.tmp")
     torch.save(payload, temporary)
     temporary.replace(path)
+
+
+def pack_members(members: int, samples):
+    """Pack one batch per ensemble member, so each member trains on its own windows."""
+    size = len(samples) // members
+    return [pack_windows(samples[i * size : (i + 1) * size]) for i in range(members)]
 
 
 def pinball_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -226,19 +233,20 @@ def train(
     patch = model_config.patch_length
     future = math.ceil(model_config.prediction_length / patch) * patch
     batch_size = settings["batch_size"]
+    members = model_config.members
     # Windows splits off one point; training joins it back into the full sequence.
     windows = Windows(
         train_set,
         model_config.context_length + future - 1,
         1,
-        settings["steps"] * batch_size,
+        settings["steps"] * batch_size * members,
         settings["seed"],
         settings["source_power"],
     )
     loader = DataLoader(
-        Subset(windows, range(first_step * batch_size, len(windows))),
-        batch_size=batch_size,
-        collate_fn=pack_windows,
+        Subset(windows, range(first_step * batch_size * members, len(windows))),
+        batch_size=batch_size * members,
+        collate_fn=pack_windows if members == 1 else partial(pack_members, members),
         num_workers=min(8, os.cpu_count() or 1) if device.type == "cuda" else 0,
         pin_memory=device.type == "cuda",
         # A private generator keeps the global RNG, and so resumed runs, unchanged.
@@ -291,17 +299,22 @@ def train(
 
     try:
         with (output / "training.jsonl").open("w") as log:
-            for history, target, series_ids in loader:
+            for batch in loader:
                 if elapsed() >= settings["max_seconds"]:
                     break
-                sequence = torch.cat([history, target], dim=-1).to(device, non_blocking=True)
-                series_ids = series_ids.to(device, non_blocking=True)
+                inputs = []
+                for history, target, series_ids in [batch] if members == 1 else batch:
+                    sequence = torch.cat([history, target], dim=-1).to(device, non_blocking=True)
+                    inputs.append((sequence, series_ids.to(device, non_blocking=True)))
                 for group in optimizer.param_groups:
                     group["lr"] = learning_rate(step, settings["steps"], settings["learning_rate"])
                 optimizer.zero_grad(set_to_none=True)
-                # Each member trains as if alone: its own mask, full gradient and clipping.
+                # Each member trains as if alone: its own windows, mask, gradient and clipping.
                 with autocast:
-                    losses = [next_patch_loss(part, sequence, series_ids) for part in model.parts]
+                    losses = [
+                        next_patch_loss(part, sequence, series_ids)
+                        for part, (sequence, series_ids) in zip(model.parts, inputs, strict=True)
+                    ]
                     loss = torch.stack(losses).mean()
                 torch.stack(losses).sum().backward()
                 for part in model.parts:
@@ -309,7 +322,7 @@ def train(
                     nonfinite |= ~torch.isfinite(norm)
                 optimizer.step()
                 step += 1
-                windows_seen += batch_size
+                windows_seen += batch_size * members
                 if step % LOG_EVERY == 0 or step == settings["steps"]:
                     check_finite()
                     last_loss = float(loss.detach())
