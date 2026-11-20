@@ -103,15 +103,17 @@ def validate(model, batches, device) -> float | None:
         history, target = history.to(device), target.to(device)
         future = math.ceil(target.shape[-1] / patch)
         values = F.pad(history, (0, future * patch), value=float("nan"))
-        quantiles, loc, scale = model.next_patch(values, series_ids.to(device))
         first = history.shape[-1] // patch - 1
         window = slice(first, first + future)
         target = F.pad(target, (0, future * patch - target.shape[-1]), value=float("nan"))
         target = target.unflatten(-1, (future, patch)).double()
-        scaled = torch.asinh((target - loc[..., window, None]) / scale[..., window, None]).float()
-        observed = int(torch.isfinite(scaled).sum())
-        total += float(pinball_loss(quantiles[:, :, window], scaled)) * observed
-        count += observed
+        for part in model.parts:  # an ensemble reports its members' mean loss
+            quantiles, loc, scale = part.next_patch(values, series_ids.to(device))
+            scaled = torch.asinh((target - loc[..., window, None]) / scale[..., window, None])
+            scaled = scaled.float()
+            observed = int(torch.isfinite(scaled).sum())
+            total += float(pinball_loss(quantiles[:, :, window], scaled)) * observed
+            count += observed
     model.train()
     return total / count
 
@@ -297,11 +299,14 @@ def train(
                 for group in optimizer.param_groups:
                     group["lr"] = learning_rate(step, settings["steps"], settings["learning_rate"])
                 optimizer.zero_grad(set_to_none=True)
+                # Each member trains as if alone: its own mask, full gradient and clipping.
                 with autocast:
-                    loss = next_patch_loss(model, sequence, series_ids)
-                loss.backward()
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                nonfinite |= ~torch.isfinite(norm)
+                    losses = [next_patch_loss(part, sequence, series_ids) for part in model.parts]
+                    loss = torch.stack(losses).mean()
+                torch.stack(losses).sum().backward()
+                for part in model.parts:
+                    norm = torch.nn.utils.clip_grad_norm_(part.parameters(), 1.0)
+                    nonfinite |= ~torch.isfinite(norm)
                 optimizer.step()
                 step += 1
                 windows_seen += batch_size

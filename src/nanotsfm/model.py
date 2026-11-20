@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -21,6 +21,7 @@ class ModelConfig:
     layers: int = 3  # causal time layers; one variate layer follows them
     heads: int = 4
     dropout: float = 0.0
+    members: int = 1  # independently initialized models trained together; forecasts are averaged
 
     def __post_init__(self):
         for key in (
@@ -39,6 +40,8 @@ class ModelConfig:
             raise ValueError("width must split into heads of even size")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0, 1)")
+        if not isinstance(self.members, int) or self.members < 1:
+            raise ValueError("members must be a positive integer")
 
 
 def causal_scale(values: torch.Tensor, patch: int):
@@ -100,6 +103,10 @@ class NanoTSFM(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        if config.members > 1:
+            single = replace(config, members=1)
+            self.members = nn.ModuleList(NanoTSFM(single) for _ in range(config.members))
+            return
         patch = config.patch_length
         self.embed = nn.Linear(2 * patch, config.width)
         self.embed_mlp = nn.Sequential(
@@ -110,8 +117,15 @@ class NanoTSFM(nn.Module):
         self.norm = nn.RMSNorm(config.width)
         self.head = nn.Linear(config.width, patch * len(QUANTILES))
 
+    @property
+    def parts(self) -> list["NanoTSFM"]:
+        """The single models: the members of an ensemble, or the model itself."""
+        return list(self.members) if self.config.members > 1 else [self]
+
     def next_patch(self, values: torch.Tensor, series_ids: torch.Tensor):
         """Predict the next patch from [B,V,T] values; equal IDs share variate attention."""
+        if self.config.members > 1:
+            raise ValueError("Call next_patch on each of an ensemble's parts")
         batch, variates, length = values.shape
         patch = self.config.patch_length
         if length % patch:
@@ -146,6 +160,9 @@ class NanoTSFM(nn.Module):
         return quantiles.sort(dim=-1).values, loc, scale
 
     def forward(self, history: torch.Tensor, series_ids: torch.Tensor) -> torch.Tensor:
+        if self.config.members > 1:
+            # Average the members' quantiles; a mean of sorted quantiles stays sorted.
+            return torch.stack([part(history, series_ids) for part in self.parts]).mean(0)
         patch, horizon = self.config.patch_length, self.config.prediction_length
         future = math.ceil(horizon / patch)
         values = F.pad(history, (0, future * patch), value=float("nan"))
